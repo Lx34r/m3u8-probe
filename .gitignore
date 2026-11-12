@@ -1,0 +1,12 @@
+# 录制产物：里面是你自己站点的真实地址，不进仓库
+.runs/
+m3u8-report.html
+*.ndjson
+
+# 探针浏览器的独立 profile
+m3u8-probe-profile/
+
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
