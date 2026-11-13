@@ -358,7 +358,6 @@ async function main() {
   const requestInfo = new Map();
   const pending = new Set();
   let session = null;
-  let sniffChain = Promise.resolve();
   let finishing = false;
 
   const track = (promise) => {
@@ -415,14 +414,24 @@ async function main() {
     track(resolveHit(hit));
   }
 
+  // getResponseBody 可能永远不回（渲染进程把响应体丢了或正忙）。嗅探是串行的，
+  // 一条挂住会拖死后面所有嗅探（响应体被回收→body 腿漏判），还会卡住 finish 的收尾。
+  // 所以每条都限时，超时就跳过这条嗅探，url/mime 两条腿和复取不受影响。
+  const BODY_TIMEOUT_MS = 4000;
   async function sniffBody(entry) {
     state.sniffed += 1;
     let body;
+    let timer;
     try {
-      const res = await session.send('Network.getResponseBody', { requestId: entry.requestId });
+      const res = await Promise.race([
+        session.send('Network.getResponseBody', { requestId: entry.requestId }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('getResponseBody 超时')), BODY_TIMEOUT_MS); }),
+      ]);
       body = res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body;
     } catch {
       return;
+    } finally {
+      clearTimeout(timer);
     }
     if (isPlaylistBody(body)) addHit({ ...entry, detectedBy: 'body', body });
   }
@@ -434,9 +443,9 @@ async function main() {
     if (verdict === 'hit') {
       addHit({ ...entry, detectedBy: looksLikePlaylistUrl(entry.url) ? 'url' : 'mime' });
     } else if (verdict === 'sniff' && args.sniff) {
-      sniffChain = sniffChain.then(() => sniffBody(entry)).catch((err) => {
-        report.error(`嗅探出错: ${err.message}`);
-      });
+      // 响应体只在渲染进程里留一小会儿：串行排队会让后面的嗅探等到体被回收。
+      // 每条响应一到就立刻取体（各自限时），收尾统一等 pending。
+      track(sniffBody(entry));
     }
   }
 
@@ -446,7 +455,6 @@ async function main() {
     if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
     return (async () => {
       await Promise.allSettled([...pending]);
-      await sniffChain.catch(() => {});
       const hits = dedupeHits(state.hits);
       const meta = {
         requests: state.requests,
