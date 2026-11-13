@@ -1,3 +1,5 @@
+import { canReachBridge } from './local-target.js';
+
 const JSON_HEADERS = { 'content-type': 'application/json' };
 
 async function jsonOrThrow(res) {
@@ -12,7 +14,8 @@ async function jsonOrThrow(res) {
   return body;
 }
 
-export async function detectBridge() {
+export async function detectBridge(href) {
+  if (!canReachBridge(href)) return null;
   try {
     const res = await fetch('api/health', { signal: AbortSignal.timeout(2000), cache: 'no-store' });
     if (!res.ok) return null;
@@ -72,6 +75,7 @@ export function playDemo(events, onEvent, intervalMs = 260) {
   const step = () => {
     if (i >= events.length) {
       timer = null;
+      onEvent('end', { code: 0 });
       return;
     }
     const event = events[i];

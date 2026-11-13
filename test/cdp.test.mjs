@@ -239,7 +239,7 @@ test('waitForPageTarget: rejects on timeout when nothing is listening', async ()
   await assert.rejects(waitForPageTarget(port, { timeoutMs: 300, intervalMs: 50 }), /timed out|timeout/i);
 });
 
-// break: returning before the process tree is dead, so the caller deletes a profile the browser still locks
+// break: reporting success while the browser is still shutting down
 test('stopBrowser: resolves only after the spawned process has exited', { timeout: 20000 }, async () => {
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   await stopBrowser(child);

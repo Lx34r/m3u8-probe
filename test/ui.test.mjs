@@ -11,6 +11,8 @@ import {
   reorderIds,
 } from '../ui/store.js';
 import { seededRandom, demoEvents } from '../ui/demo.js';
+import { playDemo, detectBridge } from '../ui/api.js';
+import { canReachBridge } from '../ui/local-target.js';
 import { exportJson, exportCsv, exportAddresses } from '../ui/export.js';
 
 function hit(overrides = {}) {
@@ -549,4 +551,45 @@ test('END: does not erase an error that arrived first', () => {
   assert.equal(s.run.status, 'error');
   assert.equal(s.run.error, '接不上调试端口');
   assert.equal(s.run.code, 1);
+});
+// break: 演示模式播完最后一条就停在 recording，开始录制按钮永远是灰的
+test('playDemo: signals completion with an end event, like the bridge does', async () => {
+  const seen = [];
+  const stop = playDemo([{ t: 'log', text: 'a' }, { t: 'summary', meta: {}, hits: [] }], (name, payload) => seen.push([name, payload]), 1);
+  await new Promise((r) => setTimeout(r, 400));
+  stop();
+  assert.deepEqual(seen.map(([n]) => n), ['log', 'summary', 'end']);
+  assert.equal(seen.at(-1)[1].code, 0);
+});
+
+test('playDemo: cancelling mid-stream never emits end', async () => {
+  const seen = [];
+  const stop = playDemo([{ t: 'log', text: 'a' }, { t: 'log', text: 'b' }, { t: 'summary', meta: {}, hits: [] }], (name) => seen.push(name), 200);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(seen, ['log'], '前提不成立：取消时应当只播了一条');
+  stop();
+  await new Promise((r) => setTimeout(r, 500));
+  assert.deepEqual(seen, ['log']);
+});
+
+// break: Pages 上每次开页都发一个必然 404 的 api/health，调试工具自己先报一条红
+test('canReachBridge: only a loopback page origin can reach the bridge', () => {
+  for (const href of ['http://127.0.0.1:8787/', 'http://localhost:5173/app/', 'http://[::1]:8787/', 'http://127.0.0.99:8787/']) {
+    assert.equal(canReachBridge(href), true, href);
+  }
+  for (const href of ['https://example.github.io/m3u8-probe/', 'http://192.168.1.5:8787/', 'file:///C:/ui/index.html', '', null, undefined]) {
+    assert.equal(canReachBridge(href), false, String(href));
+  }
+});
+
+test('detectBridge: a remote page never sends the probe', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; throw new Error('should not be called'); };
+  try {
+    assert.equal(await detectBridge('https://example.github.io/m3u8-probe/'), null);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

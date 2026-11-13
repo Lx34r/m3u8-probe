@@ -837,7 +837,7 @@ async function boot() {
   bindActions();
   render();
 
-  const health = await api.detectBridge();
+  const health = await api.detectBridge(location.href);
   if (health) {
     dispatch({ type: 'CONNECTION_SET', mode: 'live' });
     const list = $('browser-candidates');

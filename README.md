@@ -33,7 +33,7 @@
 
 ## 用法
 
-需要 Node.js ≥ 22（用到内置的 `WebSocket` / `fetch`）。**没有 npm 依赖。**
+需要 Node.js ≥ 22.4（内置 `WebSocket` 从 22.4 起默认可用，`fetch` 更早）。**没有 npm 依赖。**
 
 ### 网页控制台（推荐）
 
@@ -69,7 +69,7 @@ Pages 只有静态文件，没有本地桥接，所以线上版本用一份**按
 要录你自己的站点，就在本地跑 `node bridge.mjs`。
 
 部署：把 `ui/` 作为 Pages 产物即可，`.github/workflows/pages.yml` 已经配好，
-推送到 `main` 就会发布（先在仓库 Settings → Pages 里把 Source 设为 GitHub Actions）。
+推送到 `main` 就会自动开启 Pages 并发布。
 
 ## 测试
 

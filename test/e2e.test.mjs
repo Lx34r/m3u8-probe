@@ -51,12 +51,28 @@ function freePort() {
   });
 }
 
-function runProbe(args, timeoutMs = 90000) {
+function runProbe(args, timeoutMs = 90000, onEvent = null) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [PROBE, ...args], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [PROBE, ...args], { cwd: ROOT, stdio: [onEvent ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
-    child.stdout.on('data', (d) => { out += d; });
+    let pending = '';
+    child.stdout.on('data', (d) => {
+      out += d;
+      if (!onEvent) return;
+      pending += d;
+      let nl;
+      while ((nl = pending.indexOf('\n')) !== -1) {
+        const line = pending.slice(0, nl);
+        pending = pending.slice(nl + 1);
+        if (line === '') continue;
+        try {
+          onEvent(JSON.parse(line), child);
+        } catch {
+          // 非 JSON 行不在这里判，交给用例的逐行解析断言
+        }
+      }
+    });
     child.stderr.on('data', (d) => { err += d; });
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
@@ -65,6 +81,22 @@ function runProbe(args, timeoutMs = 90000) {
     child.on('error', (e) => { clearTimeout(timer); reject(e); });
     child.on('exit', (code) => { clearTimeout(timer); resolve({ code, out, err }); });
   });
+}
+
+// 浏览器退干净之后，Windows 还要一会儿才放开 profile 里的内存映射文件：实测空闲
+// 1.4 秒，与整套用例并发时 3.7 / 8.4 / 18.1 秒。rmSync 的 maxRetries 不为 EPERM
+// 重试——用 FileShare.None 夹具量过，0/5/100 次都是 1ms 就抛——所以自己等。
+async function removeWorkspace(dir, budgetMs = 30000) {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if (Date.now() >= deadline) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
 }
 
 async function withWorkspace(fn) {
@@ -79,7 +111,7 @@ async function withWorkspace(fn) {
   } finally {
     await new Promise((resolve) => server.close(resolve));
     try {
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+      await removeWorkspace(dir);
     } catch (cleanupErr) {
       if (!failed) throw cleanupErr;
       console.error(`(cleanup failed, keeping the real assertion error: ${cleanupErr.message})`);
@@ -275,11 +307,24 @@ test('e2e: the bridge drives a real capture and Stop finishes it gracefully', { 
 test('e2e: --ndjson emits one parseable event per line and ends with a complete summary', { timeout: 150000 }, async () => {
   await withWorkspace(async ({ dir, base }) => {
     const port = await freePort();
+    // 前提要在用例里构造：等三条腿都解析完再收尾，而不是赌固定墙钟够跑完夹具序列。
+    // --timeout 只当兜底，机器慢时它不再决定量到的是半截还是整场。
+    const wanted = ['/hls/master.m3u8', '/api/inline', '/stream/playlist'].map((p) => base + p);
+    const seen = new Set();
+    let stopped = false;
     const { code, out, err } = await runProbe([
       `${base}/`, '--port', String(port), '--ndjson',
-      '--user-data-dir', path.join(dir, 'profile'), '--timeout', '12000',
-    ]);
+      '--user-data-dir', path.join(dir, 'profile'), '--timeout', '60000',
+    ], 90000, (e, child) => {
+      if (stopped || e.t !== 'resolved' || !e.hit) return;
+      if (wanted.includes(e.hit.url)) seen.add(e.hit.url);
+      if (seen.size === wanted.length) {
+        stopped = true;
+        child.stdin.write('stop\n');
+      }
+    });
     assert.equal(code, 0, `probe exited ${code}\n${out}\n${err}`);
+    assert.ok(stopped, '事件驱动的收尾没触发：三条腿没在兜底超时前凑齐');
 
     const lines = out.split('\n').filter((l) => l.length > 0);
     assert.ok(lines.length >= 4, `expected several events, got ${lines.length}\n${out}`);
