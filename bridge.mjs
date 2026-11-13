@@ -5,9 +5,9 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULT_BROWSER_CANDIDATES } from './cdp.mjs';
-import { isLocalTarget } from './ui/local-target.js';
+import { validateDownloadRequest, createDownloadRegistry, findDownloader } from './downloader.mjs';
 
-export { isLocalTarget };
+export { validateDownloadRequest };
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUN_KEYS = new Set(['url', 'port', 'exe', 'userDataDir', 'sniff', 'timeoutMs', 'open', 'keepOpen']);
@@ -51,9 +51,6 @@ export function validateRunRequest(body) {
 
   if (body.url !== undefined && body.url !== null && body.url !== '') {
     if (typeof body.url !== 'string') return { ok: false, error: 'url 必须是字符串' };
-    if (!isLocalTarget(body.url)) {
-      return { ok: false, error: `只接受本地地址（localhost / 127.0.0.1 / [::1]），拒绝：${body.url}` };
-    }
     config.url = body.url;
   }
   if (body.port !== undefined) {
@@ -163,9 +160,16 @@ function lineSplitter(onLine) {
   };
 }
 
-export function createBridge({ uiDir, runsDir, probePath }) {
+export function createBridge({ uiDir, runsDir, probePath, downloadsRoot, resolveDownloader, spawnDownloader }) {
   const runs = new Map();
   let active = null;
+  const resolveExe = (explicit) => (resolveDownloader ? resolveDownloader(explicit) : findDownloader(explicit));
+  // spawnDownloader 注入给测试用；生产路径就是 child_process.spawn
+  const downloads = createDownloadRegistry({
+    saveRoot: downloadsRoot ?? path.join(runsDir, '..', 'downloads'),
+    resolveExe,
+    spawnFn: spawnDownloader ?? spawn,
+  });
 
   function push(run, event, data) {
     const id = run.frames.length;
@@ -255,12 +259,18 @@ export function createBridge({ uiDir, runsDir, probePath }) {
 
     if (parts[0] === 'api') {
       if (parts[1] === 'health' && req.method === 'GET') {
+        const dlVerdict = resolveExe(null);
         sendJson(res, 200, {
           ok: true,
           name: 'm3u8-probe-bridge',
           version: 1,
           browsers: DEFAULT_BROWSER_CANDIDATES.filter((p) => fs.existsSync(p)),
           probe: probePath,
+          downloader: {
+            exe: dlVerdict.ok ? dlVerdict.exe : null,
+            source: dlVerdict.ok ? dlVerdict.source : null,
+            saveDir: downloadsRoot ?? null,
+          },
         });
         return;
       }
@@ -314,6 +324,49 @@ export function createBridge({ uiDir, runsDir, probePath }) {
         res.end(fs.readFileSync(file));
         return;
       }
+      if (parts[1] === 'downloads' && parts.length === 2 && req.method === 'GET') {
+        sendJson(res, 200, { downloads: downloads.snapshot() });
+        return;
+      }
+      if (parts[1] === 'downloads' && parts.length === 2 && req.method === 'POST') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          sendJson(res, 400, { error: err.message });
+          return;
+        }
+        const verdict = validateDownloadRequest(body);
+        if (!verdict.ok) {
+          sendJson(res, 400, { error: verdict.error });
+          return;
+        }
+        const started = downloads.startDownload(verdict.config);
+        sendJson(res, 201, { downloadId: started.id, config: started.dl.config, startedAt: started.dl.startedAt, error: started.error ?? null });
+        return;
+      }
+      if (parts[1] === 'downloads' && parts[2] && parts[3] === 'events' && req.method === 'GET') {
+        const dl = downloads.get(parts[2]);
+        if (!dl) return sendJson(res, 404, { error: `没有这个下载任务: ${parts[2]}` });
+        openEvents(req, res, dl);
+        return;
+      }
+      if (parts[1] === 'downloads' && parts[2] && parts[3] === 'stop' && req.method === 'POST') {
+        const dl = downloads.get(parts[2]);
+        if (!dl) return sendJson(res, 404, { error: `没有这个下载任务: ${parts[2]}` });
+        const stopped = downloads.stopDownload(parts[2]);
+        sendJson(res, 200, { ok: true, stopped });
+        return;
+      }
+      if (parts[1] === 'downloads' && parts[2] && parts[3] === 'open' && req.method === 'POST') {
+        const dl = downloads.get(parts[2]);
+        if (!dl || !dl.finalFile || !fs.existsSync(dl.finalFile)) {
+          return sendJson(res, 404, { error: '下载还没产出文件，或文件已被移动' });
+        }
+        spawn('explorer.exe', ['/select,', path.resolve(dl.finalFile)], { stdio: 'ignore', detached: true });
+        sendJson(res, 200, { ok: true, file: dl.finalFile });
+        return;
+      }
       sendJson(res, 404, { error: `不认识的接口: ${req.method} ${url.pathname}` });
       return;
     }
@@ -360,6 +413,7 @@ export function createBridge({ uiDir, runsDir, probePath }) {
         await Promise.race([done, new Promise((r) => setTimeout(r, 15000))]);
         if (!run.ended) run.child.kill();
       }
+      downloads.stopAll();
       for (const run of runs.values()) {
         for (const res of run.subscribers) res.end();
         run.subscribers.clear();
@@ -378,8 +432,7 @@ const HELP = `m3u8-probe bridge — 把 CLI 包成本地网页控制台
   -h, --help   显示本帮助
 
 打开 http://127.0.0.1:<port>/ 就是控制台。点"开始录制"会启动一个独立 profile 的
-Edge/Chrome 窗口，你在那个窗口里操作到视频播放，再点"停止并出报告"。
-只接受 localhost / 127.0.0.1 / [::1] 的起始地址。`;
+Edge/Chrome 窗口，你在那个窗口里操作到视频播放，再点"停止并出报告"。`;
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -410,6 +463,7 @@ async function main() {
     uiDir: path.join(HERE, 'ui'),
     runsDir: path.join(HERE, '.runs'),
     probePath: path.join(HERE, 'm3u8-probe.mjs'),
+    downloadsRoot: path.join(HERE, 'downloads'),
   });
   try {
     await bridge.listen(port, '127.0.0.1');

@@ -7,6 +7,9 @@ export const DEFAULT_CONFIG = {
   timeoutMs: 0,
   open: false,
   keepOpen: false,
+  dlDir: '',
+  dlHeaders: '',
+  dlExe: '',
 };
 
 const LOG_LIMIT = 300;
@@ -32,6 +35,9 @@ export function initialState() {
     views: [],
     undo: [],
     seq: 0,
+    // 下载任务是运行时状态：不持久化、不进导出，刷新后由 GET /api/downloads 恢复
+    downloads: [],
+    downloader: { exe: null, saveDir: null, missing: false },
   };
 }
 
@@ -312,6 +318,24 @@ export function reduce(state, action) {
 
     case 'VIEW_DELETE':
       return { ...state, views: state.views.filter((v) => v.id !== action.id) };
+
+    // 下载任务：一条事件就地合并，未知 id 忽略（晚到的 SSE 帧可能属于已被清除的任务）
+    case 'DOWNLOADS_SET':
+      return { ...state, downloads: [...action.downloads] };
+
+    case 'DOWNLOADER_SET':
+      return { ...state, downloader: { ...state.downloader, ...action.info } };
+
+    case 'DL_UPDATE': {
+      const rest = state.downloads.filter((d) => d.id !== action.download.id);
+      return { ...state, downloads: [...rest, action.download] };
+    }
+
+    case 'DL_REMOVE':
+      return { ...state, downloads: state.downloads.filter((d) => d.id !== action.id) };
+
+    case 'DL_CLEAR_DONE':
+      return { ...state, downloads: state.downloads.filter((d) => d.status === 'running') };
 
     default:
       return state;

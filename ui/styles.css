@@ -201,6 +201,13 @@ code {
 .field.switch > label { margin: 0; }
 .field.switch .hint { grid-column: 1 / -1; }
 
+/* 下载配置小节：和上面录制配置的隔断 */
+.sub-title {
+  margin: 16px 0 11px; padding-top: 13px; border-top: 1px dashed var(--line-soft);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+  color: var(--faint); font-weight: 600;
+}
+
 .toggle {
   width: 40px; height: 22px; border-radius: 999px; cursor: pointer; flex: none;
   background: var(--sink); border: 1px solid var(--line); position: relative; padding: 0;
@@ -612,6 +619,49 @@ table.variants td.url, td.url { font-family: var(--mono); word-break: break-all;
 .copy-btn.copied { border-color: #276b52; color: var(--body); background: rgba(82, 227, 164, .12); }
 .copy-btn.copied .ico-copy { display: none; }
 .copy-btn.copied .ico-check { display: inline; }
+
+/* ---------- 下载按钮：地址行上的圆形下载图标 ---------- */
+.dl-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: none; border-radius: 8px; cursor: pointer;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  transition: border-color .14s, color .14s, background .14s;
+}
+.dl-btn:hover { border-color: #2b8f68; color: var(--body); background: rgba(82, 227, 164, .12); }
+.dl-btn:active { transform: translateY(1px); }
+.dl-btn::before {
+  content: ""; width: 13px; height: 13px; flex: none;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 4v10m0 0l-4.5-4.5M12 14l4.5-4.5M5 19h14'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 4v10m0 0l-4.5-4.5M12 14l4.5-4.5M5 19h14'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+/* ---------- 下载面板 ---------- */
+.downloads-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.dl-empty { color: var(--faint); font-size: 12.5px; padding: 10px 4px; }
+.dl-row {
+  padding: 10px 11px; border-radius: 10px;
+  background: rgba(10, 16, 32, .62); border: 1px solid var(--line-soft);
+  display: flex; flex-direction: column; gap: 7px;
+}
+.dl-row.running { border-color: var(--accent-deep); }
+.dl-row.failed { border-color: #7a3540; }
+.dl-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+.dl-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 12px; color: var(--text);
+}
+.dl-pct { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 650; }
+.dl-track { height: 7px; }
+.dl-row.running .rung-bar { background: linear-gradient(90deg, var(--url), var(--body)); }
+.dl-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 12px;
+  font-size: 11.5px; color: var(--muted); font-family: var(--mono);
+}
+.dl-meta .err { color: var(--live); }
+.dl-file { word-break: break-all; color: var(--body); }
+.dl-actions { display: flex; gap: 6px; }
+.ok-text { color: var(--body); font-size: 12.5px; word-break: break-all; }
 
 .results-empty {
   display: flex; flex-direction: column; align-items: center; gap: 9px; text-align: center;

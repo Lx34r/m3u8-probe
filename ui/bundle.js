@@ -13,19 +13,7 @@ window.__m3u8 = m3u8ui;
 m3u8ui["localTarget"] = {};
 window.__m3u8Stage = "local-target.js";
 (() => {
-// 这个工具只服务于"你自己的本地站点"。任意第三方地址一律拒绝，别把它变成抽流器。
-// 桥接和前端共用这一份判据，避免两边的规则各自漂移。
-function isLocalTarget(url) {
-  if (url === null || url === undefined || url === '') return true;
-  if (typeof url !== 'string') return false;
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return false;
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+function isLoopbackHost(host) {
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host === '[::1]') return true;
   const v4 = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
@@ -43,9 +31,10 @@ function canReachBridge(href) {
     return false;
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-  return isLocalTarget(href);
+  return isLoopbackHost(parsed.hostname.toLowerCase().replace(/\.$/, ''));
 }
-m3u8ui["localTarget"] = { isLocalTarget: isLocalTarget, canReachBridge: canReachBridge };
+
+m3u8ui["localTarget"] = { canReachBridge: canReachBridge };
 })();
 
 // ----- autostop.js -----
@@ -100,6 +89,9 @@ const DEFAULT_CONFIG = {
   timeoutMs: 0,
   open: false,
   keepOpen: false,
+  dlDir: '',
+  dlHeaders: '',
+  dlExe: '',
 };
 
 const LOG_LIMIT = 300;
@@ -125,6 +117,9 @@ function initialState() {
     views: [],
     undo: [],
     seq: 0,
+    // 下载任务是运行时状态：不持久化、不进导出，刷新后由 GET /api/downloads 恢复
+    downloads: [],
+    downloader: { exe: null, saveDir: null, missing: false },
   };
 }
 
@@ -406,6 +401,24 @@ function reduce(state, action) {
     case 'VIEW_DELETE':
       return { ...state, views: state.views.filter((v) => v.id !== action.id) };
 
+    // 下载任务：一条事件就地合并，未知 id 忽略（晚到的 SSE 帧可能属于已被清除的任务）
+    case 'DOWNLOADS_SET':
+      return { ...state, downloads: [...action.downloads] };
+
+    case 'DOWNLOADER_SET':
+      return { ...state, downloader: { ...state.downloader, ...action.info } };
+
+    case 'DL_UPDATE': {
+      const rest = state.downloads.filter((d) => d.id !== action.download.id);
+      return { ...state, downloads: [...rest, action.download] };
+    }
+
+    case 'DL_REMOVE':
+      return { ...state, downloads: state.downloads.filter((d) => d.id !== action.id) };
+
+    case 'DL_CLEAR_DONE':
+      return { ...state, downloads: state.downloads.filter((d) => d.status === 'running') };
+
     default:
       return state;
   }
@@ -599,7 +612,37 @@ function demoEvents(config, seed = 1) {
 
   return events;
 }
-m3u8ui["demo"] = { seededRandom: seededRandom, demoEvents: demoEvents };
+
+// 演示模式下的下载任务：照 N_m3u8DL-CLI 的真实事件形状播一遍。
+// 进度行的格式来自 Watcher.cs（Progress: now/total (pct) -- size/size），这里只取事件语义。
+function demoDownloadEvents(url, seed = 1) {
+  const rand = seededRandom(seed);
+  const events = [];
+  const total = 8 + Math.floor(rand() * 6);
+  const push = (t, extra = {}) => events.push({ t, ...extra });
+
+  push('started', { downloadId: `demo-dl-${seed}`, config: { url, saveName: 'demo-video', saveDir: 'C:\\demo\\downloads' } });
+  push('log', { text: '下载器: C:/demo/N_m3u8DL-CLI/N_m3u8DL-CLI.exe（演示数据，没有真的启动下载器）' });
+  push('phase', { phase: 'parsing' });
+  push('log', { text: '解析m3u8内容' });
+  push('phase', { phase: 'downloading' });
+  push('log', { text: '开始下载文件' });
+  for (let i = 1; i <= total; i += 1) {
+    const percent = ((i / total) * 100).toFixed(2);
+    push('log', { text: `Progress: ${i}/${total} (${percent}%) -- ${(i * 2.3).toFixed(1)}MB/${(total * 2.3).toFixed(1)}MB (3.1MB/s)` });
+    push('progress', { done: i, total, percent: Number(percent), speed: '3.1MB/s' });
+  }
+  push('phase', { phase: 'downloaded' });
+  push('log', { text: '已下载完毕' });
+  push('phase', { phase: 'merging' });
+  push('log', { text: '开始合并分片...' });
+  push('log', { text: '使用ffmpeg合并...请耐心等待' });
+  push('phase', { phase: 'done' });
+  push('log', { text: '任务结束' });
+  push('end', { code: 0, ok: true, finalFile: 'C:\\demo\\downloads\\demo-video.mp4', saveDir: 'C:\\demo\\downloads' });
+  return events;
+}
+m3u8ui["demo"] = { seededRandom: seededRandom, demoEvents: demoEvents, demoDownloadEvents: demoDownloadEvents };
 })();
 
 // ----- export.js -----
@@ -705,6 +748,45 @@ function artifactUrl(runId, name) {
   return `api/runs/${encodeURIComponent(runId)}/artifact/${name}`;
 }
 
+async function listDownloads() {
+  return jsonOrThrow(await fetch('api/downloads', { cache: 'no-store' }));
+}
+
+async function startDownload(body) {
+  return jsonOrThrow(await fetch('api/downloads', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }));
+}
+
+async function stopDownload(id) {
+  return jsonOrThrow(await fetch(`api/downloads/${encodeURIComponent(id)}/stop`, { method: 'POST' }));
+}
+
+async function openDownload(id) {
+  return jsonOrThrow(await fetch(`api/downloads/${encodeURIComponent(id)}/open`, { method: 'POST' }));
+}
+
+// 下载任务和录制 run 共用同一套 SSE 重放协议（frames + Last-Event-ID）
+function openDownloadEvents(id, onEvent, onConnection) {
+  const source = new EventSource(`api/downloads/${encodeURIComponent(id)}/events`);
+  const names = ['started', 'log', 'progress', 'phase', 'error', 'end'];
+  for (const name of names) {
+    source.addEventListener(name, (e) => {
+      if (e.data === undefined) return;
+      let payload;
+      try {
+        payload = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      onEvent(name, payload);
+    });
+  }
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) onConnection('closed');
+    else onConnection('retrying');
+  };
+  return () => source.close();
+}
+
 // EventSource 自己的连接错误没有 data；探针发来的 error 事件有。两者要分开。
 function openEvents(runId, onEvent, onConnection) {
   const source = new EventSource(`api/runs/${encodeURIComponent(runId)}/events`);
@@ -748,7 +830,7 @@ function playDemo(events, onEvent, intervalMs = 260) {
     timer = null;
   };
 }
-m3u8ui["apiMod"] = { detectBridge: detectBridge, startRun: startRun, stopRun: stopRun, getActive: getActive, artifactUrl: artifactUrl, openEvents: openEvents, playDemo: playDemo };
+m3u8ui["apiMod"] = { detectBridge: detectBridge, startRun: startRun, stopRun: stopRun, getActive: getActive, artifactUrl: artifactUrl, listDownloads: listDownloads, startDownload: startDownload, stopDownload: stopDownload, openDownload: openDownload, openDownloadEvents: openDownloadEvents, openEvents: openEvents, playDemo: playDemo };
 })();
 
 // ----- app.js -----
@@ -762,18 +844,17 @@ const serialize = m3u8ui["store"].serialize;
 const hydrate = m3u8ui["store"].hydrate;
 const reorderIds = m3u8ui["store"].reorderIds;
 const demoEvents = m3u8ui["demo"].demoEvents;
+const demoDownloadEvents = m3u8ui["demo"].demoDownloadEvents;
 const exportJson = m3u8ui["exportMod"].exportJson;
 const exportCsv = m3u8ui["exportMod"].exportCsv;
 const exportAddresses = m3u8ui["exportMod"].exportAddresses;
-const isLocalTarget = m3u8ui["localTarget"].isLocalTarget;
 const autoStopDecision = m3u8ui["autostop"].autoStopDecision;
 const collectAddresses = m3u8ui["autostop"].collectAddresses;
 const AUTO_STOP_DEFAULTS = m3u8ui["autostop"].AUTO_STOP_DEFAULTS_getter();
-const api = { detectBridge: m3u8ui["apiMod"].detectBridge, startRun: m3u8ui["apiMod"].startRun, stopRun: m3u8ui["apiMod"].stopRun, getActive: m3u8ui["apiMod"].getActive, artifactUrl: m3u8ui["apiMod"].artifactUrl, openEvents: m3u8ui["apiMod"].openEvents, playDemo: m3u8ui["apiMod"].playDemo };
+const api = { detectBridge: m3u8ui["apiMod"].detectBridge, startRun: m3u8ui["apiMod"].startRun, stopRun: m3u8ui["apiMod"].stopRun, getActive: m3u8ui["apiMod"].getActive, artifactUrl: m3u8ui["apiMod"].artifactUrl, listDownloads: m3u8ui["apiMod"].listDownloads, startDownload: m3u8ui["apiMod"].startDownload, stopDownload: m3u8ui["apiMod"].stopDownload, openDownload: m3u8ui["apiMod"].openDownload, openDownloadEvents: m3u8ui["apiMod"].openDownloadEvents, openEvents: m3u8ui["apiMod"].openEvents, playDemo: m3u8ui["apiMod"].playDemo };
 
 window.__m3u8Stage = "app.js";
 (() => {
-
 
 
 
@@ -820,6 +901,9 @@ let busy = false;
 let autoFetch = null;
 let copiedUrl = null;
 let copiedTimer = null;
+// 下载任务的 SSE 关闭函数，按任务 id 记
+const downloadClosers = new Map();
+let demoDownloadCancels = new Set();
 
 function persist() {
   try {
@@ -977,10 +1061,6 @@ function startDemo() {
 
 async function onStart() {
   if (busy) return;
-  if (!isLocalTarget(state.config.url.trim())) {
-    dispatch({ type: 'ERROR', text: `只接受本地地址（localhost / 127.0.0.1 / [::1]），拒绝：${state.config.url}` });
-    return;
-  }
   busy = true;
   stopStreaming();
   if (state.connection === 'live') await startLive();
@@ -1053,6 +1133,115 @@ async function onFetch() {
   render();
 }
 
+/* ---------------- 下载 ---------------- */
+const PHASE_LABEL = {
+  parsing: '解析中', downloading: '下载中', downloaded: '已下载完', merging: '合并中', done: '完成', failed: '失败', live: '直播流',
+};
+
+function handleDownloadEvent(id, name, payload) {
+  if (name === 'log') return; // 下载日志进面板的精简视图就够，不挤运行日志
+  const current = state.downloads.find((d) => d.id === id);
+  const base = current ?? { id, url: payload.config?.url ?? '', status: 'running', done: 0, total: 0, percent: 0, speed: null };
+  switch (name) {
+    case 'started':
+      dispatch({ type: 'DL_UPDATE', download: { ...base, status: 'running', saveName: payload.config?.saveName, saveDir: payload.config?.saveDir } });
+      break;
+    case 'progress':
+      dispatch({ type: 'DL_UPDATE', download: { ...base, status: 'running', done: payload.done, total: payload.total, percent: payload.percent, speed: payload.speed } });
+      break;
+    case 'phase':
+      dispatch({ type: 'DL_UPDATE', download: { ...base, phase: payload.phase } });
+      break;
+    case 'error':
+      dispatch({ type: 'DL_UPDATE', download: { ...base, lastError: payload.text } });
+      break;
+    case 'end': {
+      const close = downloadClosers.get(id);
+      if (close) { close(); downloadClosers.delete(id); }
+      dispatch({
+        type: 'DL_UPDATE',
+        download: {
+          ...base, code: payload.code, ok: payload.ok, finalFile: payload.finalFile, saveDir: payload.saveDir,
+          status: payload.ok ? 'done' : 'failed',
+          percent: payload.ok ? 100 : base.percent,
+        },
+      });
+      toast(payload.ok ? `下载完成：${payload.finalFile}` : '下载失败，看下载面板里的日志');
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function wireDownloadEvents(id) {
+  if (downloadClosers.has(id)) return;
+  downloadClosers.set(id, api.openDownloadEvents(id, (name, payload) => handleDownloadEvent(id, name, payload), () => {}));
+}
+
+async function onDownload(url) {
+  if (!url) return;
+  if (state.connection === 'demo') {
+    const events = demoDownloadEvents(url, demoSeed);
+    demoSeed = (demoSeed * 1103515245 + 12345) % 2147483647;
+    // 演示下载走同一套 dispatch：每个事件按 id 合并进 downloads
+    const id = events[0].downloadId;
+    dispatch({ type: 'DL_UPDATE', download: { id, url, status: 'running', done: 0, total: 0, percent: 0 } });
+    const cancel = api.playDemo(events.slice(1), (name, payload) => handleDownloadEvent(id, name, payload), 160);
+    demoDownloadCancels.add(cancel);
+    toast('演示下载已开始（演示模式不会真的下载）');
+    render();
+    return;
+  }
+  const body = {
+    url,
+    saveDir: state.config.dlDir.trim() !== '' ? state.config.dlDir.trim() : undefined,
+    headers: state.config.dlHeaders.trim() !== '' ? state.config.dlHeaders.trim() : undefined,
+    exe: state.config.dlExe.trim() !== '' ? state.config.dlExe.trim() : undefined,
+  };
+  try {
+    const created = await api.startDownload(body);
+    if (created.error) {
+      toast(created.error, false);
+      return;
+    }
+    wireDownloadEvents(created.downloadId);
+    dispatch({ type: 'DL_UPDATE', download: { id: created.downloadId, url, status: 'running', done: 0, total: 0, percent: 0, saveName: created.config.saveName, saveDir: created.config.saveDir } });
+    toast('已开始下载，进度在下面「下载」面板里');
+    render();
+  } catch (err) {
+    dispatch({ type: 'DOWNLOADER_SET', info: { missing: true } });
+    toast(`下载失败：${err.message}`);
+    render();
+  }
+}
+
+async function onStopDownload(id) {
+  if (state.connection === 'demo') return;
+  try {
+    await api.stopDownload(id);
+    toast('已停止下载');
+  } catch (err) {
+    toast(`停止失败：${err.message}`);
+  }
+}
+
+async function onOpenDownload(id) {
+  if (state.connection === 'demo') { toast('演示模式没有真的文件'); return; }
+  try {
+    await api.openDownload(id);
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+function onClearDoneDownloads() {
+  for (const cancel of demoDownloadCancels) cancel();
+  demoDownloadCancels = new Set();
+  dispatch({ type: 'DL_CLEAR_DONE' });
+  render();
+}
+
 /* ---------------- rendering ---------------- */
 const DETECT_LABEL = { url: 'URL', mime: 'mimeType', body: '响应体' };
 const KIND_LABEL = { master: 'master', media: 'media', variant: '码流', unknown: '待解析' };
@@ -1060,14 +1249,9 @@ const KIND_LABEL = { master: 'master', media: 'media', variant: '码流', unknow
 function renderHero() {
   const hero = $('hero-url');
   if (document.activeElement !== hero && hero.value !== state.config.url) hero.value = state.config.url;
-  const url = state.config.url.trim();
-  const bad = url !== '' && !isLocalTarget(url);
-  hero.classList.toggle('invalid', bad);
   const hint = $('hero-hint');
-  hint.classList.toggle('error', bad);
-  hint.textContent = bad
-    ? `这不是本地地址，只接受 localhost / 127.0.0.1 / [::1]：${url}`
-    : '只接受 localhost / 127.0.0.1 / [::1]。取到地址并解析完会自动收尾，不用手动点停止。';
+  hint.classList.remove('error');
+  hint.textContent = '填要调试的页面地址。取到地址并解析完会自动收尾，不用手动点停止。';
 
   const running = ['starting', 'recording', 'stopping'].includes(state.run.status);
   const fetch = $('btn-fetch');
@@ -1120,6 +1304,13 @@ function copyButton(url, label) {
   return btn;
 }
 
+function downloadButton(url) {
+  return el('button', {
+    class: 'dl-btn', type: 'button', title: '用 N_m3u8DL-CLI 下载这个地址', 'aria-label': `下载 ${url}`,
+    onclick: () => onDownload(url),
+  });
+}
+
 function renderResults() {
   const host = $('results-list');
   host.replaceChildren();
@@ -1146,7 +1337,7 @@ function renderResults() {
       empty.append(el('p', { class: 'warn-text', text: state.run.error || '出错了，看上面的状态条。' }));
     } else {
       empty.append(
-        el('p', {}, '还没有地址。填好上面的本地地址，点「获取 m3u8 地址」。'),
+        el('p', {}, '还没有地址。填好上面的页面地址，点「获取 m3u8 地址」。'),
         el('p', { class: 'hint' }, '判定有三条腿：地址含 .m3u8、响应类型是 mpegurl、响应体以 #EXTM3U 开头。'),
       );
     }
@@ -1159,6 +1350,7 @@ function renderResults() {
       el('span', { class: `addr-kind kind-${row.kind}`, text: KIND_LABEL[row.kind] ?? row.kind }),
       el('code', { class: 'addr-url', text: row.url, title: row.url }),
       copyButton(row.url, '地址'),
+      downloadButton(row.url),
     ));
   });
 }
@@ -1178,14 +1370,9 @@ function renderConfig() {
     $(id).setAttribute('aria-checked', String(Boolean(c[key])));
   }
 
-  const url = c.url.trim();
-  const bad = url !== '' && !isLocalTarget(url);
-  $('cfg-url').classList.toggle('invalid', bad);
   const hint = $('cfg-url-hint');
-  hint.classList.toggle('error', bad);
-  hint.textContent = bad
-    ? `这不是本地地址，桥接会拒绝：${url}`
-    : '只接受 localhost / 127.0.0.1 / [::1]。留空则开空白页，你自己在探针窗口里打开站点。';
+  hint.classList.remove('error');
+  hint.textContent = '与上面的地址栏是同一个值。留空则开空白页，你自己在探针窗口里打开站点。';
 
   const portBad = !Number.isInteger(c.port) || c.port < 1 || c.port > 65535;
   $('cfg-port').classList.toggle('invalid', portBad);
@@ -1457,6 +1644,7 @@ function renderCard(hit) {
   card.append(el('div', { class: 'card-actions' },
     el('button', { class: 'btn small', type: 'button', onclick: () => openDrawer(hit.id) }, '详情'),
     el('button', { class: 'btn small', type: 'button', onclick: () => copyText(hit.url, '地址') }, '复制'),
+    downloadButton(hit.url),
     el('button', {
       class: 'btn small danger', type: 'button', title: '删除（可撤销）',
       onclick: () => { dispatch({ type: 'DELETE', ids: [hit.id] }); toast('已删除 1 条命中', true); },
@@ -1536,6 +1724,7 @@ function renderDrawer() {
   body.append(el('p', { class: 'url-block', text: hit.url }));
   body.append(el('div', { class: 'copy-row' },
     el('button', { class: 'btn small', type: 'button', onclick: () => copyText(hit.url, '地址') }, '复制地址'),
+    el('button', { class: 'btn small', type: 'button', onclick: () => onDownload(hit.url) }, '下载'),
     el('button', {
       class: 'btn small', type: 'button',
       onclick: () => copyText(`curl -L '${hit.url.replace(/'/g, "'\\''")}'`, 'curl 命令'),
@@ -1622,6 +1811,67 @@ function renderLog() {
   host.scrollTop = host.scrollHeight;
 }
 
+function downloadRow(dl) {
+  const running = dl.status === 'running';
+  const pct = Math.max(0, Math.min(100, dl.percent ?? 0));
+  const row = el('div', { class: `dl-row${running ? ' running' : ''}${dl.status === 'failed' ? ' failed' : ''}` });
+  const head = el('div', { class: 'dl-head' },
+    el('span', { class: 'dl-name', text: dl.saveName ?? dl.url, title: dl.url }),
+    el('span', { class: 'badge' }, running
+      ? el('span', { class: 'dl-pct', text: `${pct.toFixed(1)}%` })
+      : el('span', { text: PHASE_LABEL[dl.phase] ?? (dl.status === 'done' ? '完成' : '失败') })),
+  );
+  row.append(head);
+  if (running || dl.status === 'done') {
+    row.append(el('div', { class: 'rung-track dl-track' },
+      el('span', { class: 'rung-bar', style: `width:${Math.max(2, pct)}%` })));
+  }
+  const meta = [];
+  if (running && dl.speed) meta.push(el('span', { text: dl.speed }));
+  if (running && dl.total > 0) meta.push(el('span', { text: `${dl.done}/${dl.total} 分片` }));
+  if (dl.lastError) meta.push(el('span', { class: 'err', text: dl.lastError }));
+  if (dl.status === 'done' && dl.finalFile) meta.push(el('span', { class: 'dl-file', text: dl.finalFile, title: dl.finalFile }));
+  if (meta.length > 0) row.append(el('div', { class: 'dl-meta' }, meta));
+
+  const actions = el('div', { class: 'dl-actions' });
+  if (running) actions.append(el('button', { class: 'btn small danger', type: 'button', onclick: () => onStopDownload(dl.id) }, '停止'));
+  if (dl.status === 'done' && dl.finalFile) actions.append(el('button', { class: 'btn small', type: 'button', onclick: () => onOpenDownload(dl.id) }, '打开所在位置'));
+  if (actions.children.length > 0) row.append(actions);
+  return row;
+}
+
+function renderDownloads() {
+  const host = $('downloads-list');
+  if (!host) return;
+  host.replaceChildren();
+  const count = $('downloads-count');
+  if (count) count.textContent = String(state.downloads.length);
+
+  const status = $('dl-cli-status');
+  if (status) {
+    status.replaceChildren();
+    if (state.connection !== 'live') {
+      status.append(el('span', { text: '演示模式：下载按钮会放一份演示进度，不会真的下载。' }));
+    } else if (state.downloader.exe) {
+      status.append(el('span', { class: 'ok-text', text: `已找到下载器：${state.downloader.exe}` }));
+    } else {
+      status.append(
+        el('span', { class: 'warn-text', text: '没找到 N_m3u8DL-CLI.exe。把它放进项目目录（或 tools/、PATH），或在下面填完整路径。' }),
+        el('a', { class: 'link-btn', href: 'https://github.com/nilaoda/N_m3u8DL-CLI/releases', target: '_blank', rel: 'noopener' }, '去 Releases 下载'),
+      );
+    }
+  }
+
+  if (state.downloads.length === 0) {
+    host.append(el('div', { class: 'dl-empty', text: '还没有下载任务。在地址输出或命中卡片上点「下载」按钮。' }));
+    return;
+  }
+  // 在跑的排前面，其余按加入时间倒序，一眼看到正在进行的那条
+  const ordered = [...state.downloads].sort((a, b) => (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1));
+  for (const dl of ordered) host.append(downloadRow(dl));
+  $('btn-dl-clear-done').disabled = !state.downloads.some((d) => d.status !== 'running');
+}
+
 function render() {
   renderMode();
   renderHero();
@@ -1634,6 +1884,7 @@ function render() {
   renderBulk();
   renderHits();
   renderLog();
+  renderDownloads();
   if (drawerId) renderDrawer();
 }
 
@@ -1663,6 +1914,10 @@ function bindConfig() {
   text('cfg-exe', 'exe');
   text('cfg-profile', 'userDataDir');
   num('cfg-timeout', 'timeoutMs');
+  text('cfg-dl-dir', 'dlDir');
+  text('cfg-dl-headers', 'dlHeaders');
+  text('cfg-dl-exe', 'dlExe');
+  $('btn-dl-clear-done').addEventListener('click', onClearDoneDownloads);
   for (const [id, key] of [['cfg-sniff', 'sniff'], ['cfg-keepopen', 'keepOpen'], ['cfg-open', 'open']]) {
     $(id).addEventListener('click', () => dispatch({ type: 'CONFIG_SET', key, value: !state.config[key] }));
   }
@@ -1787,6 +2042,22 @@ async function boot() {
     dispatch({ type: 'CONNECTION_SET', mode: 'live' });
     const list = $('browser-candidates');
     list.replaceChildren(...(health.browsers ?? []).map((b) => el('option', { value: b })));
+    dispatch({
+      type: 'DOWNLOADER_SET',
+      info: { exe: health.downloader?.exe ?? null, saveDir: health.downloader?.saveDir ?? null, missing: !health.downloader?.exe },
+    });
+    // 刷新页面后恢复在跑的下载任务：列表快照先到位，再逐个接上事件流
+    try {
+      const { downloads } = await api.listDownloads();
+      if (downloads.length > 0) {
+        dispatch({ type: 'DOWNLOADS_SET', downloads });
+        for (const dl of downloads) {
+          if (dl.status === 'running') wireDownloadEvents(dl.id);
+        }
+      }
+    } catch {
+      // 下载列表拉不到不影响别的功能
+    }
     const active = await api.getActive();
     if (active.runId) {
       dispatch({ type: 'RUN_STARTED', runId: active.runId, startedAt: active.startedAt });

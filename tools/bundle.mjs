@@ -50,9 +50,8 @@ const NEEDS = {
   'app.js': {
     named: {
       'store.js': ['DEFAULT_CONFIG', 'initialState', 'reduce', 'selectVisible', 'toRunRequest', 'serialize', 'hydrate', 'reorderIds'],
-      'demo.js': ['demoEvents'],
+      'demo.js': ['demoEvents', 'demoDownloadEvents'],
       'export.js': ['exportJson', 'exportCsv', 'exportAddresses'],
-      'local-target.js': ['isLocalTarget'],
       'autostop.js': ['autoStopDecision', 'collectAddresses', 'AUTO_STOP_DEFAULTS'],
     },
     namespace: 'api.js',

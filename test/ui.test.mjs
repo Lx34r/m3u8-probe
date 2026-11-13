@@ -10,7 +10,7 @@ import {
   hydrate,
   reorderIds,
 } from '../ui/store.js';
-import { seededRandom, demoEvents } from '../ui/demo.js';
+import { seededRandom, demoEvents, demoDownloadEvents } from '../ui/demo.js';
 import { playDemo, detectBridge } from '../ui/api.js';
 import { autoStopDecision, collectAddresses } from '../ui/autostop.js';
 import { canReachBridge } from '../ui/local-target.js';
@@ -634,4 +634,80 @@ test('collectAddresses: hits plus master variants, deduped in first-seen order',
 test('collectAddresses: drops empty and non-string urls', () => {
   const rows = collectAddresses([{ url: '', detectedBy: 'url', playlist: { variants: [{ url: null }, { url: 'http://local.test/a.m3u8' }] } }]);
   assert.deepEqual(rows.map((r) => r.url), ['http://local.test/a.m3u8']);
+});
+
+// ---------- 下载任务 ----------
+
+test('initialState: downloads start empty and the downloader is unknown', () => {
+  const s = initialState();
+  assert.deepEqual(s.downloads, []);
+  assert.deepEqual(s.downloader, { exe: null, saveDir: null, missing: false });
+});
+
+test('DL_UPDATE: merges by id, an unknown id becomes a new row, does not mutate', () => {
+  const s0 = initialState();
+  const s1 = reduce(s0, { type: 'DL_UPDATE', download: { id: 'd1', url: 'http://a/x.m3u8', status: 'running', percent: 10 } });
+  const s2 = reduce(s1, { type: 'DL_UPDATE', download: { id: 'd1', url: 'http://a/x.m3u8', status: 'running', percent: 50 } });
+  assert.equal(s2.downloads.length, 1);
+  assert.equal(s2.downloads[0].percent, 50);
+  assert.equal(JSON.stringify(s1.downloads[0]).includes('50'), false, 'previous state mutated');
+
+  const s3 = reduce(s2, { type: 'DL_UPDATE', download: { id: 'd2', url: 'http://a/y.m3u8', status: 'running' } });
+  assert.equal(s3.downloads.length, 2);
+});
+
+test('DL_REMOVE and DL_CLEAR_DONE keep running tasks untouched', () => {
+  let s = run(initialState(),
+    { type: 'DL_UPDATE', download: { id: 'd1', status: 'running' } },
+    { type: 'DL_UPDATE', download: { id: 'd2', status: 'done' } },
+    { type: 'DL_UPDATE', download: { id: 'd3', status: 'failed' } });
+  s = reduce(s, { type: 'DL_CLEAR_DONE' });
+  assert.deepEqual(s.downloads.map((d) => d.id), ['d1'], 'only the running task survives');
+  s = reduce(s, { type: 'DL_REMOVE', id: 'd1' });
+  assert.deepEqual(s.downloads, []);
+});
+
+test('DOWNLOADS_SET replaces the list (used by the boot reattach snapshot)', () => {
+  let s = reduce(initialState(), { type: 'DL_UPDATE', download: { id: 'd0', status: 'running' } });
+  s = reduce(s, { type: 'DOWNLOADS_SET', downloads: [{ id: 'd9', status: 'running', percent: 30 }] });
+  assert.deepEqual(s.downloads.map((d) => d.id), ['d9']);
+});
+
+test('serialize/hydrate: downloads and downloader state never reach localStorage', () => {
+  let s = run(initialState(),
+    { type: 'DL_UPDATE', download: { id: 'd1', status: 'running' } },
+    { type: 'DOWNLOADER_SET', info: { exe: 'C:/x.exe', missing: false } });
+  const saved = JSON.parse(JSON.stringify(serialize(s)));
+  assert.equal(saved.downloads, undefined);
+  assert.equal(saved.downloader, undefined);
+  const back = hydrate(saved);
+  assert.deepEqual(back.downloads, []);
+});
+
+// break: 下载配置是后加的字段，旧版本 localStorage 里没有它——hydrate 必须兜底
+test('hydrate: saved config without the dl fields falls back to the defaults', () => {
+  const back = hydrate({ version: 1, config: { url: '', port: 9222 } });
+  assert.equal(back.config.dlDir, '');
+  assert.equal(back.config.dlHeaders, '');
+  assert.equal(back.config.dlExe, '');
+});
+
+test('demoDownloadEvents: deterministic for a seed, ends with a successful end event', () => {
+  const a = demoDownloadEvents('http://local.test/hls/x.m3u8', 7);
+  const b = demoDownloadEvents('http://local.test/hls/x.m3u8', 7);
+  assert.deepEqual(a, b);
+  assert.notDeepEqual(a, demoDownloadEvents('http://local.test/hls/x.m3u8', 8));
+
+  assert.equal(a[0].t, 'started');
+  const end = a.at(-1);
+  assert.equal(end.t, 'end');
+  assert.equal(end.ok, true);
+  assert.ok(end.finalFile, JSON.stringify(end));
+
+  const progress = a.filter((e) => e.t === 'progress');
+  assert.ok(progress.length >= 3, `expected several progress frames, got ${progress.length}`);
+  for (let i = 1; i < progress.length; i += 1) {
+    assert.ok(progress[i].done >= progress[i - 1].done, 'progress must not go backwards');
+  }
+  assert.equal(a.some((e) => e.t === 'error'), false, 'a clean demo download must not emit errors');
 });

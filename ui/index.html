@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>m3u8-probe · 本地流地址获取器</title>
-<meta name="description" content="本地开发用的网页 m3u8 调试录制器：输入你自己的本地地址，一键取出真实的 m3u8 播放地址。">
+<meta name="description" content="网页 m3u8 调试录制器：输入要调试的页面地址，一键取出真实的 m3u8 播放地址。">
 <link rel="stylesheet" href="styles.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23080c17'/%3E%3Cpath d='M8 21V11l6 5 6-5v10' stroke='%234fd8ff' stroke-width='2.4' fill='none' stroke-linejoin='round'/%3E%3Ccircle cx='24' cy='12' r='2.4' fill='%2352e3a4'/%3E%3C/svg%3E">
 </head>
@@ -46,12 +46,12 @@
 <main class="layout">
   <section class="capture panel" aria-labelledby="capture-title">
     <div class="capture-head">
-      <h2 id="capture-title">输入本地地址，一键取出 m3u8</h2>
+      <h2 id="capture-title">输入页面地址，一键取出 m3u8</h2>
       <p class="capture-sub">它驱动你本机的 Edge / Chrome 打开这个地址，录下真实网络请求，找出页面到底在取哪个 playlist。</p>
     </div>
 
     <form class="capture-bar" id="capture-form">
-      <label class="sr-only" for="hero-url">要调试的本地页面地址</label>
+      <label class="sr-only" for="hero-url">要调试的页面地址</label>
       <span class="capture-scheme" aria-hidden="true">
         <svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3.4 12h17.2M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>
       </span>
@@ -63,7 +63,7 @@
       </button>
       <button id="btn-fetch-stop" class="btn danger" type="button" hidden>停止</button>
     </form>
-    <p class="hint" id="hero-hint">只接受 localhost / 127.0.0.1 / [::1]。取到地址并解析完会自动收尾，不用手动点停止。</p>
+    <p class="hint" id="hero-hint">填要调试的页面地址。取到地址并解析完会自动收尾，不用手动点停止。</p>
 
     <ol class="pipeline" id="pipeline" aria-label="获取进度">
       <li data-step="start"><span class="pip-dot" aria-hidden="true"></span><span class="pip-text">启动浏览器</span></li>
@@ -154,6 +154,27 @@
               <span class="knob" aria-hidden="true"></span>
             </button>
           </div>
+
+          <h3 class="sub-title">下载（N_m3u8DL-CLI）</h3>
+
+          <div class="field">
+            <label for="cfg-dl-exe">下载器可执行文件</label>
+            <input id="cfg-dl-exe" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="留空自动找 N_m3u8DL-CLI.exe">
+          </div>
+
+          <div class="field">
+            <label for="cfg-dl-dir">保存目录</label>
+            <input id="cfg-dl-dir" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="留空用项目目录下的 downloads\">
+          </div>
+
+          <div class="field">
+            <label for="cfg-dl-headers">下载请求头</label>
+            <input id="cfg-dl-headers" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="Referer:http://…|Cookie:…（多段用 | 分隔）">
+            <p class="hint">传给 N_m3u8DL-CLI 的 <code>--headers</code>；地址复取需要请求头时这里也照填一份。</p>
+          </div>
         </section>
 
         <section class="panel actions">
@@ -172,6 +193,15 @@
             <button id="btn-clear" class="btn" type="button">清空列表</button>
           </div>
           <p class="hint" id="artifact-links"></p>
+        </section>
+
+        <section class="panel downloads" aria-labelledby="downloads-title">
+          <h2 class="panel-title" id="downloads-title">
+            下载 <span id="downloads-count" class="pill">0</span>
+            <button id="btn-dl-clear-done" class="link-btn" type="button">清除已完成</button>
+          </h2>
+          <p class="hint" id="dl-cli-status"></p>
+          <div id="downloads-list" class="downloads-list"></div>
         </section>
 
         <section class="panel">
@@ -241,11 +271,21 @@
     <ol>
       <li>在项目目录跑 <code>node bridge.mjs</code>，它只监听 127.0.0.1。</li>
       <li>打开它给出的地址（默认 <code>http://127.0.0.1:8787/</code>）。</li>
-      <li>在顶部地址栏填你自己的本地页面地址，点<strong>获取 m3u8 地址</strong>。</li>
+      <li>在顶部地址栏填要调试的页面地址，点<strong>获取 m3u8 地址</strong>。</li>
       <li>它会开一个独立 profile 的浏览器窗口录请求；取到地址并解析完就自动收尾。</li>
       <li>地址输出区每条右边都有<strong>复制</strong>，也可以一次复制全部或导出 .txt。</li>
     </ol>
     <p>如果页面要你点一下才起播，去探针窗口里点一下；工具会等地址解析完再收尾，最长等待由「兜底收尾」决定。</p>
+    <h3>下载到文件</h3>
+    <ol>
+      <li>把 <a href="https://github.com/nilaoda/N_m3u8DL-CLI/releases" target="_blank" rel="noopener">N_m3u8DL-CLI.exe</a>
+        放进项目根目录、<code>tools/</code>，或在左侧「下载」配置里填完整路径；合并成 mp4 还需要 ffmpeg 在它同目录或 PATH 里。</li>
+      <li>地址输出区每行、命中卡片、详情抽屉里都有<strong>下载</strong>按钮。</li>
+      <li>进度、阶段（下载 → 合并）和最终文件位置显示在左侧「下载」面板。</li>
+      <li>保存目录默认是项目下的 <code>downloads\</code>，可以在「下载」配置里改。</li>
+    </ol>
+    <p>和录制一致：一次下载一个地址，由你在界面上亲手点出来。加密流由 CLI 自己按 playlist 里的密钥解密；
+      直播流不支持自动下载（CLI 在无人值守下会挂起），面板会明确报错。</p>
     <h3>判定有三条腿</h3>
     <ul>
       <li><code>url</code>：地址里含 <code>.m3u8</code></li>
@@ -254,8 +294,8 @@
     </ul>
     <p>第三条腿受 CDP 限制：页面 <code>fetch</code> 后没读过的响应体取不回来，这种只能靠前两条腿。</p>
     <h3>范围</h3>
-    <p>这是"你自己驱动的浏览器 + localhost"的录制器。起始地址只接受
-      <code>localhost</code> / <code>127.0.0.1</code> / <code>[::1]</code>，不做批量抓取，也不面向第三方站点。</p>
+    <p>这是"你自己驱动的浏览器"的调试录制器：你看着它开哪个页面、自己点停止，
+      不做批量抓取，也不代表你自动浏览任何站点。</p>
     <h3>演示模式</h3>
     <p>没有本地桥接时（比如 GitHub Pages 上），页面用一份按当前配置生成的示例数据驱动，
       所有控件照常可用，但不会真的启动浏览器。点<strong>随机示例</strong>换一批。</p>

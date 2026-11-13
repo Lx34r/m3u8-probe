@@ -46,6 +46,45 @@ export function artifactUrl(runId, name) {
   return `api/runs/${encodeURIComponent(runId)}/artifact/${name}`;
 }
 
+export async function listDownloads() {
+  return jsonOrThrow(await fetch('api/downloads', { cache: 'no-store' }));
+}
+
+export async function startDownload(body) {
+  return jsonOrThrow(await fetch('api/downloads', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }));
+}
+
+export async function stopDownload(id) {
+  return jsonOrThrow(await fetch(`api/downloads/${encodeURIComponent(id)}/stop`, { method: 'POST' }));
+}
+
+export async function openDownload(id) {
+  return jsonOrThrow(await fetch(`api/downloads/${encodeURIComponent(id)}/open`, { method: 'POST' }));
+}
+
+// 下载任务和录制 run 共用同一套 SSE 重放协议（frames + Last-Event-ID）
+export function openDownloadEvents(id, onEvent, onConnection) {
+  const source = new EventSource(`api/downloads/${encodeURIComponent(id)}/events`);
+  const names = ['started', 'log', 'progress', 'phase', 'error', 'end'];
+  for (const name of names) {
+    source.addEventListener(name, (e) => {
+      if (e.data === undefined) return;
+      let payload;
+      try {
+        payload = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      onEvent(name, payload);
+    });
+  }
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) onConnection('closed');
+    else onConnection('retrying');
+  };
+  return () => source.close();
+}
+
 // EventSource 自己的连接错误没有 data；探针发来的 error 事件有。两者要分开。
 export function openEvents(runId, onEvent, onConnection) {
   const source = new EventSource(`api/runs/${encodeURIComponent(runId)}/events`);

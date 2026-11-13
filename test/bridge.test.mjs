@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import {
-  isLocalTarget,
   validateRunRequest,
   buildProbeArgs,
   sseFrame,
@@ -16,55 +16,6 @@ import {
 import { attachStopControl } from '../m3u8-probe.mjs';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-
-// break: the tool becoming a scraper for arbitrary third-party sites
-test('isLocalTarget: loopback hosts are allowed', () => {
-  for (const url of [
-    'http://localhost:3000/',
-    'http://127.0.0.1:53100/hls/',
-    'http://[::1]:8080/',
-    'http://sub.localhost:5173/',
-    'https://localhost:8443/',
-    'http://127.0.0.2/',
-    'http://localhost.:3000/',
-  ]) {
-    assert.equal(isLocalTarget(url), true, url);
-  }
-});
-
-// break: an evasion form slipping past a naive string match
-test('isLocalTarget: alternative IPv4 spellings normalise to loopback and stay allowed', () => {
-  for (const url of ['http://2130706433/', 'http://0x7f000001/', 'http://0177.0.0.1/', 'http://127.1/']) {
-    assert.equal(isLocalTarget(url), true, url);
-  }
-});
-
-test('isLocalTarget: everything that is not loopback is refused', () => {
-  for (const url of [
-    'https://www.thisav02.net/cn/vec-550-uncensored-leak',
-    'https://example.com/',
-    'http://192.168.1.5/',
-    'http://10.0.0.1/',
-    'http://127.0.0.1.evil.com/',
-    'http://evil.com/?next=127.0.0.1',
-    'http://localhost.evil.com/',
-    'http://0.0.0.0/',
-    'http://[::ffff:127.0.0.1]/',
-    'http://[2001:db8::1]/',
-    'file:///C:/Users/me/site/index.html',
-    'javascript:alert(1)',
-    'data:text/html,hi',
-    'ftp://localhost/',
-    'not a url at all',
-  ]) {
-    assert.equal(isLocalTarget(url), false, url);
-  }
-});
-
-test('isLocalTarget: no start URL means a blank page, which is allowed', () => {
-  assert.equal(isLocalTarget(null), true);
-  assert.equal(isLocalTarget(''), true);
-});
 
 test('validateRunRequest: defaults match the CLI defaults', () => {
   const r = validateRunRequest({});
@@ -81,11 +32,12 @@ test('validateRunRequest: defaults match the CLI defaults', () => {
   });
 });
 
-test('validateRunRequest: a remote target is refused and the message says why', () => {
-  const r = validateRunRequest({ url: 'https://example.com/video' });
-  assert.equal(r.ok, false);
-  assert.match(r.error, /localhost|127\.0\.0\.1|本地/);
-  assert.match(r.error, /example\.com/, 'the refusal must name the offending host');
+test('validateRunRequest: accepts any http(s) start URL and passes it through untouched', () => {
+  for (const url of ['https://example.com/video', 'http://localhost:3000/', 'http://192.168.1.5:8080/app/']) {
+    const r = validateRunRequest({ url });
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.config.url, url);
+  }
 });
 
 test('validateRunRequest: bad port, timeout and types are refused by name', () => {
@@ -212,6 +164,22 @@ function tempUi() {
   return dir;
 }
 
+// 假下载器进程：mode=true 落一个最终文件再 Exit 0；mode='empty' 只 Exit 0 不落文件
+function fakeDownloaderProcess(mode, saveDir, args) {
+  const proc = new EventEmitter();
+  proc.stdout = new PassThrough();
+  proc.stderr = new PassThrough();
+  proc.kill = () => {};
+  setImmediate(() => {
+    if (mode !== 'empty') {
+      const saveName = args[args.indexOf('--saveName') + 1];
+      fs.writeFileSync(path.join(saveDir, `${saveName}.mp4`), 'x');
+    }
+    proc.emit('close', 0, null);
+  });
+  return proc;
+}
+
 async function withBridge(fn, opts = {}) {
   const uiDir = tempUi();
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm3u8-bridge-runs-'));
@@ -222,11 +190,20 @@ async function withBridge(fn, opts = {}) {
     probePath = path.join(workDir, 'fake-probe.mjs');
     fs.writeFileSync(probePath, opts.fakeProbe);
   }
-  const bridge = createBridge({ uiDir, runsDir, probePath });
+  const bridge = createBridge({
+    uiDir,
+    runsDir,
+    probePath,
+    downloadsRoot: opts.downloadsRoot ?? path.join(workDir, 'downloads'),
+    resolveDownloader: opts.resolveDownloader,
+    spawnDownloader: opts.fakeDownloaderSpawn
+      ? (exe, args) => fakeDownloaderProcess(opts.fakeDownloaderSpawn, path.join(workDir, 'downloads'), args)
+      : undefined,
+  });
   await bridge.listen(0, '127.0.0.1');
   const base = `http://127.0.0.1:${bridge.port()}`;
   try {
-    return await fn({ base, bridge, uiDir, runsDir });
+    return await fn({ base, bridge, uiDir, runsDir, workDir });
   } finally {
     await bridge.close();
     fs.rmSync(uiDir, { recursive: true, force: true });
@@ -265,17 +242,25 @@ test('bridge: serves the ui and refuses to leave it', async () => {
   });
 });
 
-// break: the bridge accepting a third-party target and becoming the refused scraper
-test('bridge: POST /api/runs refuses a non-local target with 400', async () => {
+test('bridge: POST /api/runs accepts a remote target and hands it to the probe', async () => {
   await withBridge(async ({ base }) => {
     const res = await fetch(`${base}/api/runs`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url: 'https://example.com/watch' }),
     });
-    assert.equal(res.status, 400);
-    const body = await res.json();
-    assert.match(body.error, /example\.com/);
+    const created = await res.text();
+    assert.equal(res.status, 201, created);
+    const { runId } = JSON.parse(created);
+    const started = await (await fetch(`${base}/api/runs/${runId}/events`)).text();
+    assert.match(started, /event: started/);
+    assert.match(started, /example\.com/, 'the start URL must reach the probe');
+    await fetch(`${base}/api/runs/${runId}/stop`, { method: 'POST' });
+  }, {
+    fakeProbe: `process.stdout.write(JSON.stringify({ t: 'log', text: 'url=' + process.argv.at(-1) }) + '\\n');
+      process.stdin.resume();
+      process.stdin.on('data', (d) => { if (String(d).includes('stop')) process.exit(0); });
+      setTimeout(() => process.exit(0), 30000);`,
   });
 });
 
@@ -518,4 +503,115 @@ test('bridge: the active run reports its config so a reloaded UI can reattach', 
     assert.ok(active.startedAt, JSON.stringify(active));
     await fetch(`${base}/api/runs/${runId}/stop`, { method: 'POST' });
   }, { fakeProbe: fake });
+});
+// ---------- 下载（N_m3u8DL-CLI） ----------
+
+// break: health 漏报下载器状态，UI 就无法在点下载前给出「没找到 CLI」的指引
+test('bridge: health reports the downloader exe and save dir', async () => {
+  await withBridge(async ({ base, workDir }) => {
+    const body = await (await fetch(`${base}/api/health`)).json();
+    assert.equal(body.ok, true);
+    assert.equal(body.downloader.exe, 'C:/fake/N_m3u8DL-CLI.exe');
+    assert.equal(body.downloader.saveDir, path.join(workDir, 'downloads'));
+  }, { resolveDownloader: () => ({ ok: true, exe: 'C:/fake/N_m3u8DL-CLI.exe', source: 'auto' }) });
+});
+
+test('bridge: POST /api/downloads validates before spawning anything', async () => {
+  await withBridge(async ({ base }) => {
+    const bad = await fetch(`${base}/api/downloads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: '' }),
+    });
+    assert.equal(bad.status, 400);
+    assert.match((await bad.json()).error, /url/);
+
+    const unknown = await fetch(`${base}/api/downloads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:1/a.m3u8', prot: 1 }),
+    });
+    assert.equal(unknown.status, 400);
+    assert.match((await unknown.json()).error, /prot/);
+
+    const notUrl = await fetch(`${base}/api/downloads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'javascript:alert(1)' }),
+    });
+    assert.equal(notUrl.status, 400);
+    assert.match((await notUrl.json()).error, /http/);
+  }, { resolveDownloader: () => ({ ok: true, exe: 'C:/fake/N_m3u8DL-CLI.exe', source: 'auto' }) });
+});
+
+// break: SSE 晚订阅者拿不到已经开始的下载事件，刷新页面后进度就丢
+test('bridge: a download streams events over SSE, replays them, and the artifact lands in saveDir', async () => {
+  await withBridge(async ({ base, workDir }) => {
+    const res = await fetch(`${base}/api/downloads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:53100/hls/master.m3u8' }),
+    });
+    const created = await res.text();
+    assert.equal(res.status, 201, created);
+    const { downloadId } = JSON.parse(created);
+    assert.ok(downloadId);
+
+    const text = await (await fetch(`${base}/api/downloads/${downloadId}/events`)).text();
+    assert.match(text, /event: started/);
+    assert.match(text, /event: end/);
+    assert.match(text, /--saveName/, 'the spawned args must be replayed for diagnostics');
+
+    // 等待任务结束，快照里必须是完成态并带最终文件
+    for (let i = 0; i < 50; i += 1) {
+      const { downloads } = await (await fetch(`${base}/api/downloads`)).json();
+      const dl = downloads.find((d) => d.id === downloadId);
+      if (dl && dl.status !== 'running') {
+        assert.equal(dl.status, 'done', JSON.stringify(dl));
+        assert.ok(fs.existsSync(dl.finalFile), dl.finalFile);
+        assert.ok(dl.finalFile.startsWith(path.join(workDir, 'downloads')), dl.finalFile);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.fail('download never finished');
+  }, {
+    resolveDownloader: () => ({ ok: true, exe: 'C:/fake/N_m3u8DL-CLI.exe', source: 'auto' }),
+    // 假下载器进程：吐一行进度，落最终文件，Exit 0
+    fakeDownloaderSpawn: true,
+  });
+});
+
+// break: CLI 异常被 catch 后照样 Exit 0——下载成败必须看文件而不是退出码
+test('bridge: a download that exits 0 without producing a file is reported failed', async () => {
+  await withBridge(async ({ base }) => {
+    const res = await fetch(`${base}/api/downloads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:53100/hls/a.m3u8' }),
+    });
+    const { downloadId } = await res.json();
+    for (let i = 0; i < 50; i += 1) {
+      const { downloads } = await (await fetch(`${base}/api/downloads`)).json();
+      const dl = downloads.find((d) => d.id === downloadId);
+      if (dl && dl.status !== 'running') {
+        assert.equal(dl.status, 'failed', JSON.stringify(dl));
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.fail('download never finished');
+  }, {
+    resolveDownloader: () => ({ ok: true, exe: 'C:/fake/N_m3u8DL-CLI.exe', source: 'auto' }),
+    fakeDownloaderSpawn: 'empty',
+  });
+});
+
+test('bridge: stopping an unknown download is a 404, not a crash', async () => {
+  await withBridge(async ({ base }) => {
+    const res = await fetch(`${base}/api/downloads/does-not-exist/stop`, { method: 'POST' });
+    assert.equal(res.status, 404);
+    const events = await fetch(`${base}/api/downloads/does-not-exist/events`);
+    assert.equal(events.status, 404);
+  });
 });

@@ -120,3 +120,33 @@ export function demoEvents(config, seed = 1) {
 
   return events;
 }
+
+// 演示模式下的下载任务：照 N_m3u8DL-CLI 的真实事件形状播一遍。
+// 进度行的格式来自 Watcher.cs（Progress: now/total (pct) -- size/size），这里只取事件语义。
+export function demoDownloadEvents(url, seed = 1) {
+  const rand = seededRandom(seed);
+  const events = [];
+  const total = 8 + Math.floor(rand() * 6);
+  const push = (t, extra = {}) => events.push({ t, ...extra });
+
+  push('started', { downloadId: `demo-dl-${seed}`, config: { url, saveName: 'demo-video', saveDir: 'C:\\demo\\downloads' } });
+  push('log', { text: '下载器: C:/demo/N_m3u8DL-CLI/N_m3u8DL-CLI.exe（演示数据，没有真的启动下载器）' });
+  push('phase', { phase: 'parsing' });
+  push('log', { text: '解析m3u8内容' });
+  push('phase', { phase: 'downloading' });
+  push('log', { text: '开始下载文件' });
+  for (let i = 1; i <= total; i += 1) {
+    const percent = ((i / total) * 100).toFixed(2);
+    push('log', { text: `Progress: ${i}/${total} (${percent}%) -- ${(i * 2.3).toFixed(1)}MB/${(total * 2.3).toFixed(1)}MB (3.1MB/s)` });
+    push('progress', { done: i, total, percent: Number(percent), speed: '3.1MB/s' });
+  }
+  push('phase', { phase: 'downloaded' });
+  push('log', { text: '已下载完毕' });
+  push('phase', { phase: 'merging' });
+  push('log', { text: '开始合并分片...' });
+  push('log', { text: '使用ffmpeg合并...请耐心等待' });
+  push('phase', { phase: 'done' });
+  push('log', { text: '任务结束' });
+  push('end', { code: 0, ok: true, finalFile: 'C:\\demo\\downloads\\demo-video.mp4', saveDir: 'C:\\demo\\downloads' });
+  return events;
+}

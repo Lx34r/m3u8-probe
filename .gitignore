@@ -3,6 +3,9 @@
 m3u8-report.html
 *.ndjson
 
+# 下载产物：视频文件不进仓库
+downloads/
+
 # 探针浏览器的独立 profile
 m3u8-probe-profile/
 
