@@ -166,11 +166,15 @@ test('e2e: detects playlists by mimeType and by response body', { timeout: 15000
     assert.ok(byMime, `mimeType-detected playlist missing. hits=${JSON.stringify(hits.map((h) => [h.url, h.detectedBy]))}\n${out}`);
     assert.equal(byMime.detectedBy, 'mime');
 
-    // characterization of a verified CDP boundary: a fetch body the page never read
-    // cannot be retrieved, so the body leg must not claim it. Measured A/B: unread
-    // gives "No data found for resource with given identifier", read gives the body.
+    // CDP boundary, re-measured after the refetch fallback: a fetch body the page
+    // never read still cannot be pulled via getResponseBody ("No data found"),
+    // but the recorder now refetches localhost URLs directly. The hit still
+    // lands on the body leg, and it is honestly labelled as a refetch instead
+    // of pretending CDP returned the body.
     const unread = hits.find((h) => h.url === `${base}/api/inline-unread`);
-    assert.equal(unread, undefined, 'CDP now returns unread fetch bodies; the body-sniff boundary moved');
+    assert.ok(unread, `unread inline candidate should now hit via refetch. hits=${JSON.stringify(hits.map((h) => [h.url, h.detectedBy]))}`);
+    assert.equal(unread.detectedBy, 'body');
+    assert.equal(unread.playlist?.segments, 2);
     assert.ok(meta.sniffed >= 2, `both inline candidates should have been sniffed, got ${meta.sniffed}`);
   });
 });

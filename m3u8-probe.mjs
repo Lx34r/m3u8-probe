@@ -346,7 +346,9 @@ async function main() {
 
   const userDataDir = args.userDataDir || defaultUserDataDir();
   fs.mkdirSync(userDataDir, { recursive: true });
-  const child = launchBrowser({ exe, port: args.port, userDataDir, url: args.url });
+  // 先开空白页：录制窗口里 Network.enable 之前发生的请求一个都录不到，
+  // 起始地址交给命令行会让整个文档加载（可能还有它的子请求）漏在录制窗口外。
+  const child = launchBrowser({ exe, port: args.port, userDataDir, url: 'about:blank' });
 
   report.log(`浏览器: ${exe}`);
   report.log(`profile: ${userDataDir}（独立 profile，不用你日常浏览器的登录数据）`);
@@ -429,6 +431,13 @@ async function main() {
       ]);
       body = res.base64Encoded ? Buffer.from(res.body, 'base64').toString('utf8') : res.body;
     } catch {
+      // 渲染进程可能已把体回收（尤其机器慢的时候）。本工具只面向 localhost，
+      // 直接复取一遍：体像 m3u8 就按 body 腿记，复取过程照常记录在 refetch 里。
+      try {
+        const res = await fetch(entry.url, { signal: AbortSignal.timeout(BODY_TIMEOUT_MS) });
+        const text = await res.text();
+        if (isPlaylistBody(text)) addHit({ ...entry, detectedBy: 'body', body: text, refetch: { ok: res.ok, status: res.status, finalUrl: res.url } });
+      } catch { /* 复取也失败就放弃这条腿，url/mime 两条腿不受影响 */ }
       return;
     } finally {
       clearTimeout(timer);
@@ -510,21 +519,31 @@ async function main() {
 
   process.on('SIGINT', () => { finish().then(() => process.exit(0)); });
   child.on('exit', () => { finish().then(() => process.exit(0)); });
-  if (args.timeoutMs > 0) setTimeout(() => { finish().then(() => process.exit(0)); }, args.timeoutMs);
   if (args.ndjson && !process.stdin.isTTY) {
     attachStopControl(process.stdin, () => { finish().then(() => process.exit(0)); });
   }
 
+  // about:blank 起步时 /json/list 可能抓到一个即将关闭的过渡 target，
+  // WebSocket 一连上就 close。重试直到真的 enable 成功，不把这种瞬时抖动判成死。
   let target;
-  try {
-    target = await waitForPageTarget(args.port, { timeoutMs: 20000 });
-    session = await connectCdp(target.webSocketDebuggerUrl);
-    await session.send('Network.enable', {});
-  } catch (err) {
-    report.error(`接不上调试端口: ${err.message}`);
-    await stopBrowser(child);
-    process.exitCode = 1;
-    return;
+  const attachDeadline = Date.now() + 20000;
+  for (;;) {
+    try {
+      target = await waitForPageTarget(args.port, { timeoutMs: 5000 });
+      session = await connectCdp(target.webSocketDebuggerUrl);
+      await session.send('Page.enable', {});
+      await session.send('Network.enable', {});
+      break;
+    } catch (err) {
+      if (session) { session.close(); session = null; }
+      if (Date.now() >= attachDeadline) {
+        report.error(`接不上调试端口: ${err.message}`);
+        await stopBrowser(child);
+        process.exitCode = 1;
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
   }
 
   session.on('Network.requestWillBeSent', (e) => {
@@ -560,6 +579,11 @@ async function main() {
       headers: info.headers,
     });
   });
+
+  if (args.timeoutMs > 0) setTimeout(() => { finish().then(() => process.exit(0)); }, args.timeoutMs);
+
+  // 订阅挂好后再导航，起始页的文档请求才落在录制窗口里
+  if (args.url) { await session.send('Page.navigate', { url: args.url }) }
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

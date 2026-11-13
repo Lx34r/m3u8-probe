@@ -270,6 +270,19 @@
   <button id="toast-close" class="icon-btn" type="button" aria-label="关闭提示">✕</button>
 </div>
 
-<script type="module" src="app.js"></script>
+<!-- http(s) 下走 ES modules（bridge / Pages）；file:// 下 ES module 被 CORS 拦，
+     自动改用 tools/bundle.mjs 生成的经典脚本，双击 index.html 即可用。 -->
+<script>
+  if (location.protocol === 'file:') {
+    const s = document.createElement('script');
+    s.src = 'bundle.js';
+    document.body.appendChild(s);
+  } else {
+    const s = document.createElement('script');
+    s.type = 'module';
+    s.src = 'app.js';
+    document.body.appendChild(s);
+  }
+</script>
 </body>
 </html>
