@@ -4,6 +4,7 @@ import {
 import { demoEvents } from './demo.js';
 import { exportJson, exportCsv, exportAddresses } from './export.js';
 import { isLocalTarget } from './local-target.js';
+import { autoStopDecision, collectAddresses, AUTO_STOP_DEFAULTS } from './autostop.js';
 import * as api from './api.js';
 
 const STORAGE_KEY = 'm3u8-probe-console-v1';
@@ -43,6 +44,10 @@ let toastTimer = null;
 let audio = null;
 let demoSeed = 1;
 let busy = false;
+// 一键获取：取到地址并解析完就自己收尾，不用人盯着点停止
+let autoFetch = null;
+let copiedUrl = null;
+let copiedTimer = null;
 
 function persist() {
   try {
@@ -138,6 +143,7 @@ function handleEvent(name, payload) {
       break;
     case 'hit':
       dispatch({ type: 'HIT', hit: payload.hit });
+      if (autoFetch) autoFetch.lastHitAt = Date.now();
       blip();
       break;
     case 'resolved':
@@ -211,6 +217,7 @@ async function onStart() {
 }
 
 async function onStop() {
+  disarmAutoFetch();
   if (state.connection === 'live' && state.run.runId && !state.run.runId.startsWith('demo-')) {
     dispatch({ type: 'RUN_STATUS', status: 'stopping' });
     try {
@@ -233,8 +240,156 @@ async function onStop() {
   render();
 }
 
+/* ---------------- 一键获取 ---------------- */
+function disarmAutoFetch() {
+  if (!autoFetch) return;
+  clearInterval(autoFetch.timer);
+  autoFetch = null;
+}
+
+function armAutoFetch() {
+  disarmAutoFetch();
+  const ceiling = state.config.timeoutMs > 0 ? state.config.timeoutMs : AUTO_STOP_DEFAULTS.maxWaitMs;
+  autoFetch = { startedAt: Date.now(), lastHitAt: Date.now(), timer: null, ceiling };
+  autoFetch.timer = setInterval(() => {
+    if (!autoFetch) return;
+    if (!['starting', 'recording'].includes(state.run.status)) { disarmAutoFetch(); render(); return; }
+    const resolved = state.hits.filter((h) => h.playlist).length;
+    const decision = autoStopDecision({
+      startedAt: autoFetch.startedAt,
+      now: Date.now(),
+      lastHitAt: autoFetch.lastHitAt,
+      hits: state.hits.length,
+      resolved,
+      maxWaitMs: autoFetch.ceiling,
+    });
+    if (!decision) return;
+    disarmAutoFetch();
+    onStop().then(() => {
+      toast(decision === 'timeout' ? '已到最长等待，先输出已经取到的地址' : '已取到地址并自动收尾');
+    });
+  }, 250);
+}
+
+async function onFetch() {
+  if (busy) return;
+  const url = $('hero-url').value.trim();
+  dispatch({ type: 'CONFIG_SET', key: 'url', value: url });
+  await onStart();
+  if (state.run.status === 'error') return;
+  armAutoFetch();
+  render();
+}
+
 /* ---------------- rendering ---------------- */
 const DETECT_LABEL = { url: 'URL', mime: 'mimeType', body: '响应体' };
+const KIND_LABEL = { master: 'master', media: 'media', variant: '码流', unknown: '待解析' };
+
+function renderHero() {
+  const hero = $('hero-url');
+  if (document.activeElement !== hero && hero.value !== state.config.url) hero.value = state.config.url;
+  const url = state.config.url.trim();
+  const bad = url !== '' && !isLocalTarget(url);
+  hero.classList.toggle('invalid', bad);
+  const hint = $('hero-hint');
+  hint.classList.toggle('error', bad);
+  hint.textContent = bad
+    ? `这不是本地地址，只接受 localhost / 127.0.0.1 / [::1]：${url}`
+    : '只接受 localhost / 127.0.0.1 / [::1]。取到地址并解析完会自动收尾，不用手动点停止。';
+
+  const running = ['starting', 'recording', 'stopping'].includes(state.run.status);
+  const fetch = $('btn-fetch');
+  // 演示录制随时可以被新的一键获取打断；真录制一次只允许一个 run，所以那时才禁用
+  const locked = busy || (state.connection === 'live' && running);
+  fetch.disabled = locked;
+  fetch.classList.toggle('is-busy', running);
+  fetch.querySelector('.fetch-label').textContent = running ? '正在获取…' : '获取 m3u8 地址';
+  $('btn-fetch-stop').hidden = !running;
+}
+
+function renderPipeline() {
+  const s = state.run.status;
+  const resolved = state.hits.filter((h) => h.playlist).length;
+  const stage = { idle: 0, starting: 1, recording: 2, stopping: 3, finished: 4, error: -1 }[s] ?? 0;
+  for (const li of $('pipeline').children) {
+    const index = ['start', 'record', 'parse', 'done'].indexOf(li.dataset.step) + 1;
+    li.classList.remove('active', 'done', 'failed');
+    if (stage === -1) { if (index === 1) li.classList.add('failed'); continue; }
+    if (index < stage || stage === 4) li.classList.add('done');
+    else if (index === stage) li.classList.add('active');
+    if (li.dataset.step === 'parse' && state.hits.length > 0) {
+      li.querySelector('.pip-text').textContent = `解析 playlist ${resolved}/${state.hits.length}`;
+    } else if (li.dataset.step === 'parse') {
+      li.querySelector('.pip-text').textContent = '解析 playlist';
+    }
+  }
+}
+
+function copyButton(url, label) {
+  const btn = el('button', {
+    class: `copy-btn${copiedUrl === url ? ' copied' : ''}`, type: 'button',
+    'aria-label': `复制${label}`,
+    onclick: async () => {
+      const ok = await copyText(url, '地址');
+      if (!ok) return;
+      copiedUrl = url;
+      if (copiedTimer) clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => { copiedUrl = null; renderResults(); }, 1600);
+      renderResults();
+    },
+  });
+  btn.append(
+    el('svg', { class: 'ico ico-copy', viewBox: '0 0 24 24', 'aria-hidden': 'true' }),
+    el('svg', { class: 'ico ico-check', viewBox: '0 0 24 24', 'aria-hidden': 'true' }),
+    el('span', { class: 'copy-text', text: copiedUrl === url ? '已复制' : '复制' }),
+  );
+  btn.querySelector('.ico-copy').innerHTML = '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/>';
+  btn.querySelector('.ico-check').innerHTML = '<path d="M5 12.5l4.5 4.5L19 7.5"/>';
+  return btn;
+}
+
+function renderResults() {
+  const host = $('results-list');
+  host.replaceChildren();
+  const rows = collectAddresses(selectVisible(state));
+  $('results-count').textContent = String(rows.length);
+  $('btn-copy-all').disabled = rows.length === 0;
+  $('btn-export-results').disabled = rows.length === 0;
+
+  const running = ['starting', 'recording', 'stopping'].includes(state.run.status);
+  if (rows.length === 0) {
+    const empty = el('div', { class: 'results-empty' });
+    if (running) {
+      empty.append(
+        el('span', { class: 'spinner big', 'aria-hidden': 'true' }),
+        el('p', {}, state.run.status === 'starting' ? '正在启动探针浏览器…' : '正在录制真实请求，取到 playlist 就会出现在这里。'),
+        el('p', { class: 'hint' }, '如果页面要点一下才起播，去弹出的浏览器窗口里点一下。'),
+      );
+    } else if (state.run.status === 'finished') {
+      empty.append(
+        el('p', { class: 'warn-text' }, '这次没取到 m3u8 地址。'),
+        el('p', { class: 'hint' }, `录制器观察到 ${state.counters.requests} 个请求、${state.counters.responses} 个响应。下面控制台里有详细诊断。`),
+      );
+    } else if (state.run.status === 'error') {
+      empty.append(el('p', { class: 'warn-text', text: state.run.error || '出错了，看上面的状态条。' }));
+    } else {
+      empty.append(
+        el('p', {}, '还没有地址。填好上面的本地地址，点「获取 m3u8 地址」。'),
+        el('p', { class: 'hint' }, '判定有三条腿：地址含 .m3u8、响应类型是 mpegurl、响应体以 #EXTM3U 开头。'),
+      );
+    }
+    host.append(empty);
+    return;
+  }
+
+  rows.forEach((row, i) => {
+    host.append(el('div', { class: `addr-row leg-${row.from}`, style: `--i:${i}` },
+      el('span', { class: `addr-kind kind-${row.kind}`, text: KIND_LABEL[row.kind] ?? row.kind }),
+      el('code', { class: 'addr-url', text: row.url, title: row.url }),
+      copyButton(row.url, '地址'),
+    ));
+  });
+}
 
 function renderConfig() {
   const c = state.config;
@@ -697,8 +852,11 @@ function renderLog() {
 
 function render() {
   renderMode();
+  renderHero();
+  renderPipeline();
   renderConfig();
   renderStatus();
+  renderResults();
   renderFilters();
   renderViews();
   renderBulk();
@@ -708,6 +866,20 @@ function render() {
 }
 
 /* ---------------- wiring ---------------- */
+function bindCapture() {
+  $('capture-form').addEventListener('submit', (e) => { e.preventDefault(); onFetch(); });
+  $('hero-url').addEventListener('input', (e) => dispatch({ type: 'CONFIG_SET', key: 'url', value: e.target.value }));
+  $('btn-fetch-stop').addEventListener('click', () => { disarmAutoFetch(); onStop(); });
+  $('btn-copy-all').addEventListener('click', () => {
+    const rows = collectAddresses(selectVisible(state));
+    copyText(rows.map((r) => r.url).join('\n'), `${rows.length} 条地址`);
+  });
+  $('btn-export-results').addEventListener('click', () => {
+    const rows = collectAddresses(selectVisible(state));
+    download('m3u8-addresses.txt', rows.map((r) => r.url).join('\n') + '\n', 'text/plain');
+  });
+}
+
 function bindConfig() {
   const text = (id, key) => $(id).addEventListener('input', (e) => dispatch({ type: 'CONFIG_SET', key, value: e.target.value }));
   const num = (id, key) => $(id).addEventListener('input', (e) => {
@@ -832,6 +1004,7 @@ function bindActions() {
 
 /* ---------------- boot ---------------- */
 async function boot() {
+  bindCapture();
   bindConfig();
   bindToolbar();
   bindActions();

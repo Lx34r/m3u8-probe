@@ -12,6 +12,7 @@ import {
 } from '../ui/store.js';
 import { seededRandom, demoEvents } from '../ui/demo.js';
 import { playDemo, detectBridge } from '../ui/api.js';
+import { autoStopDecision, collectAddresses } from '../ui/autostop.js';
 import { canReachBridge } from '../ui/local-target.js';
 import { exportJson, exportCsv, exportAddresses } from '../ui/export.js';
 
@@ -592,4 +593,45 @@ test('detectBridge: a remote page never sends the probe', async () => {
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// break: 一键获取永远不收尾，或者在 master 还没解析完时就停，把码流清单丢在半路
+test('autoStopDecision: waits for every hit to resolve, then settles', () => {
+  const base = { startedAt: 0, now: 5000, lastHitAt: 4000, hits: 2, resolved: 2 };
+  assert.equal(autoStopDecision(base), null, '刚来命中就停会丢后续码流');
+  assert.equal(autoStopDecision({ ...base, now: 5600 }), 'settled');
+  assert.equal(autoStopDecision({ ...base, resolved: 1 }), null, '还有命中没解析完');
+  assert.equal(autoStopDecision({ ...base, hits: 0, resolved: 0, now: 9000 }), null, '零命中不该提前收尾');
+  assert.equal(autoStopDecision({ ...base, hits: 0, resolved: 0, now: 30000 }), 'timeout');
+  assert.equal(autoStopDecision({ ...base, now: 31000 }), 'timeout', '兜底超时必须能收尾');
+});
+
+test('autoStopDecision: a zero-hit run still ends at the ceiling', () => {
+  const args = { startedAt: 1000, now: 1000, lastHitAt: 0, hits: 0, resolved: 0, maxWaitMs: 500 };
+  assert.equal(autoStopDecision(args), null);
+  assert.equal(autoStopDecision({ ...args, now: 1500 }), 'timeout');
+});
+
+// break: 输出区只列命中本身，master 里真正能播的码流地址反而拿不到
+test('collectAddresses: hits plus master variants, deduped in first-seen order', () => {
+  const hits = [
+    { url: 'http://local.test/hls/master.m3u8', detectedBy: 'url', playlist: { kind: 'master', variants: [{ url: 'http://local.test/hls/720.m3u8' }, { url: 'http://local.test/hls/360.m3u8' }] } },
+    { url: 'http://local.test/hls/720.m3u8', detectedBy: 'mime', playlist: { kind: 'media' } },
+    { url: 'http://local.test/api/inline', detectedBy: 'body', playlist: null },
+  ];
+  const rows = collectAddresses(hits);
+  assert.deepEqual(rows.map((r) => r.url), [
+    'http://local.test/hls/master.m3u8',
+    'http://local.test/hls/720.m3u8',
+    'http://local.test/hls/360.m3u8',
+    'http://local.test/api/inline',
+  ]);
+  assert.equal(rows[1].kind, 'variant');
+  assert.equal(rows[3].kind, 'unknown');
+  assert.deepEqual(collectAddresses([]), []);
+});
+
+test('collectAddresses: drops empty and non-string urls', () => {
+  const rows = collectAddresses([{ url: '', detectedBy: 'url', playlist: { variants: [{ url: null }, { url: 'http://local.test/a.m3u8' }] } }]);
+  assert.deepEqual(rows.map((r) => r.url), ['http://local.test/a.m3u8']);
 });
